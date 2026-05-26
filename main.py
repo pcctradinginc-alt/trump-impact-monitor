@@ -3,6 +3,7 @@ import re
 import json
 import sqlite3
 import hashlib
+import socket
 import feedparser
 import requests
 import yfinance as yf
@@ -14,6 +15,8 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import smtplib
 import sys
+
+socket.setdefaulttimeout(15)  # verhindert hängende feedparser/yfinance-Calls
 
 # ─────────────────────────────────────────────
 # CONFIG (all from GitHub Secrets / env vars)
