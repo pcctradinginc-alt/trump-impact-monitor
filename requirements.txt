@@ -1,0 +1,5 @@
+requests==2.32.3
+feedparser==6.0.11
+anthropic==0.45.2
+python-dotenv==1.0.1
+yfinance==0.2.54
