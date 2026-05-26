@@ -39,7 +39,7 @@ jobs:
           GMAIL_EMAIL:             ${{ secrets.GMAIL_EMAIL }}
           GMAIL_APP_PASSWORD:      ${{ secrets.GMAIL_APP_PASSWORD }}
           RECIPIENT_EMAIL:         ${{ secrets.RECIPIENT_EMAIL }}
-        run: python main.py
+        run: python -u main.py
 
       # ── 5. Commit updated SQLite DB back to repo ───────────────────
       - name: Commit updated alerts.db
