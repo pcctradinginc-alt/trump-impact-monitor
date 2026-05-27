@@ -17,7 +17,7 @@ from email.mime.multipart import MIMEMultipart
 import smtplib
 import sys
 
-socket.setdefaulttimeout(15)  # verhindert hängende feedparser/yfinance-Calls
+socket.setdefaulttimeout(30)  # verhindert hängende feedparser/yfinance-Calls
 
 # ─────────────────────────────────────────────
 # CONFIG (all from GitHub Secrets / env vars)
@@ -459,6 +459,7 @@ def main():
     print(f"{'='*60}\n")
 
     processed = 0
+    seen_urls: set[str] = set()   # URL-Dedup innerhalb eines Runs (verhindert Doppel-Alerts bei Mehrfach-Feeds)
 
     def _cap_reached() -> bool:
         if processed >= MAX_ALERTS_PER_RUN:
@@ -502,6 +503,11 @@ def main():
     for article in fetch_gnews_rss() + fetch_financial_rss():
         if _cap_reached():
             break
+        art_url = article.get("url", "")
+        if art_url and art_url in seen_urls:
+            continue                          # gleicher Artikel aus anderem Feed/Query
+        if art_url:
+            seen_urls.add(art_url)
         text = clean_text((article.get("title") or "") + " " + (article.get("description") or ""))
         if not text:
             continue
