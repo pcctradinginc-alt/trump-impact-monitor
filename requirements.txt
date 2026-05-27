@@ -2,3 +2,5 @@ requests==2.32.3
 feedparser==6.0.11
 anthropic==0.52.0
 yfinance==0.2.54
+transformers==4.47.1
+torch==2.5.1

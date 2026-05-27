@@ -17,41 +17,42 @@ from email.mime.multipart import MIMEMultipart
 import smtplib
 import sys
 
-socket.setdefaulttimeout(30)  # verhindert hängende feedparser/yfinance-Calls
+socket.setdefaulttimeout(30)  # globaler Timeout für feedparser / yfinance
 
-# ─────────────────────────────────────────────
-# CONFIG (all from GitHub Secrets / env vars)
-# ─────────────────────────────────────────────
-ANTHROPIC_API_KEY   = os.getenv("ANTHROPIC_API_KEY")
-SCRAPE_KEY          = os.getenv("SCRAPE_CREATORS_API_KEY")
-GMAIL_EMAIL         = os.getenv("GMAIL_EMAIL")
-GMAIL_PASS          = os.getenv("GMAIL_APP_PASSWORD")
-RECIPIENT           = os.getenv("RECIPIENT_EMAIL")
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG  (alle Werte kommen aus GitHub Secrets / lokalen Env-Vars)
+# ─────────────────────────────────────────────────────────────────────────────
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+SCRAPE_KEY        = os.getenv("SCRAPE_CREATORS_API_KEY")
+GMAIL_EMAIL       = os.getenv("GMAIL_EMAIL")
+GMAIL_PASS        = os.getenv("GMAIL_APP_PASSWORD")
+RECIPIENT         = os.getenv("RECIPIENT_EMAIL")
 
-TRUMP_TRUTH_ID      = "107780257626128497"
-DB_PATH             = "alerts.db"
-LOOKBACK_HOURS      = 24  # 24h-Fenster – SQLite-Dedup verhindert Doppel-Alerts
-MAX_ALERTS_PER_RUN  = 15  # Schutz vor Kosten-Explosion bei Breaking-News-Wellen
-MAX_TICKERS_PER_ARTICLE = 3  # max. Tickers pro Artikel, Priorität: hoch > niedrig
+TRUMP_TRUTH_ID       = "107780257626128497"
+DB_PATH              = "alerts.db"
+LOOKBACK_HOURS       = 24
+MAX_ALERTS_PER_RUN   = 10   # Schutz vor Kosten-Explosion bei Breaking-News-Wellen
+MAX_TICKERS_PER_ART  = 3    # max. Tickers pro Artikel (hoch vor niedrig)
+MODEL                = "claude-3-5-sonnet-20241022"
 
-# ─────────────────────────────────────────────
-# VALIDATE REQUIRED SECRETS
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# SECRETS-VALIDIERUNG
+# ─────────────────────────────────────────────────────────────────────────────
 REQUIRED = {
-    "ANTHROPIC_API_KEY":        ANTHROPIC_API_KEY,
-    "SCRAPE_CREATORS_API_KEY":  SCRAPE_KEY,
-    "GMAIL_EMAIL":              GMAIL_EMAIL,
-    "GMAIL_APP_PASSWORD":       GMAIL_PASS,
-    "RECIPIENT_EMAIL":          RECIPIENT,
+    "ANTHROPIC_API_KEY":       ANTHROPIC_API_KEY,
+    "SCRAPE_CREATORS_API_KEY": SCRAPE_KEY,
+    "GMAIL_EMAIL":             GMAIL_EMAIL,
+    "GMAIL_APP_PASSWORD":      GMAIL_PASS,
+    "RECIPIENT_EMAIL":         RECIPIENT,
 }
 missing = [k for k, v in REQUIRED.items() if not v]
 if missing:
     print(f"❌ Fehlende Secrets: {', '.join(missing)}")
     sys.exit(1)
 
-# ─────────────────────────────────────────────
-# SQLite SETUP
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# SQLITE  –  Dedup-Datenbank
+# ─────────────────────────────────────────────────────────────────────────────
 conn = sqlite3.connect(DB_PATH)
 conn.execute("""
     CREATE TABLE IF NOT EXISTS events (
@@ -66,13 +67,45 @@ conn.execute("""
 """)
 conn.commit()
 
-# Global Anthropic client (FIX: nicht pro Alert neu instanziieren)
+# ─────────────────────────────────────────────────────────────────────────────
+# ANTHROPIC CLIENT  (einmalig instanziieren)
+# ─────────────────────────────────────────────────────────────────────────────
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# ─────────────────────────────────────────────
-# FINANCIAL RELEVANCE KEYWORDS (Pre-Filter)
-# ─────────────────────────────────────────────
-# Trump-Erwähnung – Pflicht für allgemeine Finanz-RSS-Feeds
+# ─────────────────────────────────────────────────────────────────────────────
+# FINBERT  –  lokales Finanz-Sentiment (lazy-loaded)
+# ─────────────────────────────────────────────────────────────────────────────
+_finbert_pipeline = None
+
+def get_finbert_sentiment(text: str) -> str:
+    """
+    Lädt ProsusAI/finbert beim ersten Aufruf und gibt
+    'positiv (92.3%)'  /  'negativ (87.1%)'  /  'neutral (76.0%)'  zurück.
+    Bei Fehler: 'nicht verfügbar'.
+    """
+    global _finbert_pipeline
+    try:
+        if _finbert_pipeline is None:
+            from transformers import pipeline as hf_pipeline
+            print("  🧠 FinBERT wird geladen …")
+            _finbert_pipeline = hf_pipeline(
+                "text-classification",
+                model="ProsusAI/finbert",
+                truncation=True,
+                max_length=512,
+            )
+        result = _finbert_pipeline(text[:512])[0]
+        label_map = {"positive": "positiv", "negative": "negativ", "neutral": "neutral"}
+        label = label_map.get(result["label"].lower(), result["label"].lower())
+        score = round(result["score"] * 100, 1)
+        return f"{label} ({score}%)"
+    except Exception as e:
+        print(f"  ⚠️  FinBERT Fehler: {e}")
+        return "nicht verfügbar"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRUMP-NAMES  –  Pflichtfilter für allgemeine Finanz-RSS-Feeds
+# ─────────────────────────────────────────────────────────────────────────────
 TRUMP_NAMES = {
     "trump", "donald trump", "donald j. trump", "potus",
     "mar-a-lago", "truth social", "trump administration",
@@ -82,6 +115,9 @@ def mentions_trump(text: str) -> bool:
     t = text.lower()
     return any(name in t for name in TRUMP_NAMES)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FINANZ-KEYWORDS  –  Pre-Filter vor teurem LLM-Aufruf
+# ─────────────────────────────────────────────────────────────────────────────
 FINANCIAL_KEYWORDS = {
     "tariff", "tariffs", "sanction", "sanctions", "trade deal", "trade war",
     "invest", "investment", "stock", "shares", "market", "deal", "contract",
@@ -94,21 +130,23 @@ FINANCIAL_KEYWORDS = {
     "price", "cost", "supply chain", "jobs", "layoff", "hire",
 }
 
+def is_financially_relevant(text: str) -> bool:
+    t = text.lower()
+    return any(kw in t for kw in FINANCIAL_KEYWORDS)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEXT-REINIGUNG  –  HTML / URLs entfernen vor Entity-Matching
+# ─────────────────────────────────────────────────────────────────────────────
 def clean_text(text: str) -> str:
-    """Entfernt HTML-Tags, URLs und überflüssige Whitespaces für sauberes Entity-Matching."""
     text = html.unescape(text)
-    text = re.sub(r'https?://\S+', '', text)          # URLs entfernen
-    text = re.sub(r'<[^>]+>', ' ', text)               # HTML-Tags entfernen
+    text = re.sub(r'https?://\S+', '', text)   # URLs weg
+    text = re.sub(r'<[^>]+>', ' ', text)        # HTML-Tags weg
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
-def is_financially_relevant(text: str) -> bool:
-    text_lower = text.lower()
-    return any(kw in text_lower for kw in FINANCIAL_KEYWORDS)
-
-# ─────────────────────────────────────────────
-# HELPER FUNCTIONS
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER
+# ─────────────────────────────────────────────────────────────────────────────
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -141,7 +179,10 @@ def get_hash(text: str) -> str:
 def already_seen(h: str) -> bool:
     return conn.execute("SELECT 1 FROM events WHERE hash=?", (h,)).fetchone() is not None
 
-def send_gmail(subject: str, html_body: str):
+# ─────────────────────────────────────────────────────────────────────────────
+# E-MAIL
+# ─────────────────────────────────────────────────────────────────────────────
+def send_gmail(subject: str, html_body: str) -> bool:
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"]    = GMAIL_EMAIL
@@ -152,32 +193,36 @@ def send_gmail(subject: str, html_body: str):
             server.login(GMAIL_EMAIL, GMAIL_PASS)
             server.sendmail(GMAIL_EMAIL, RECIPIENT, msg.as_string())
         print(f"  ✅ E-Mail gesendet: {subject}")
+        return True
+    except smtplib.SMTPAuthenticationError:
+        print("  ❌ Gmail: Authentifizierung fehlgeschlagen – App-Passwort prüfen")
+    except smtplib.SMTPException as e:
+        print(f"  ❌ Gmail SMTP-Fehler: {e}")
     except Exception as e:
-        print(f"  ❌ Gmail-Fehler: {e}")
+        print(f"  ❌ Gmail unbekannter Fehler: {e}")
+    return False
 
-# ─────────────────────────────────────────────
-# ENTITY RESOLUTION – alle Tickers pro Post
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTITY RESOLUTION  –  3-Tier-Matching gegen entities.json
+# ─────────────────────────────────────────────────────────────────────────────
 ENTITIES_FILE = os.path.join(os.path.dirname(__file__), "entities.json")
 with open(ENTITIES_FILE, encoding="utf-8") as f:
     ENTITIES: dict = json.load(f)
 
 def find_all_tickers(text: str) -> list[tuple[str, str]]:
     """
-    Return ALL matching (ticker, confidence) tuples found in text.
-    3-Tier-Matching gegen strukturiertes entities.json:
-      - symbol  : case-sensitiv  (Ticker-Kürzel),            immer → "hoch"
-      - company : case-insensitiv (Firmenname/CEO/Tochter),   immer → "hoch"
-      - weak    : case-insensitiv (Produkt/Brand/Begriff),
-                  nur wenn is_financially_relevant(text)      → "niedrig"
+    Gibt alle (ticker, konfidenz) Tupel zurück die im Text gefunden werden.
+
+    Tier 1 – symbol  : case-sensitiv,   immer  → konfidenz "hoch"
+    Tier 2 – company : case-insensitiv, immer  → konfidenz "hoch"
+    Tier 3 – weak    : case-insensitiv, nur mit Finanz-Kontext → "niedrig"
     """
     results: list[tuple[str, str]] = []
-    text_has_finance = is_financially_relevant(text)
+    has_finance = is_financially_relevant(text)
 
     for ticker, tiers in ENTITIES.items():
         matched = False
 
-        # Tier 1: Symbol – case-sensitiv, immer auslösen
         for alias in tiers.get("symbol", []):
             if re.search(r'\b' + re.escape(alias) + r'\b', text):
                 results.append((ticker.upper(), "hoch"))
@@ -186,7 +231,6 @@ def find_all_tickers(text: str) -> list[tuple[str, str]]:
         if matched:
             continue
 
-        # Tier 2: Firmenname / CEO – case-insensitiv, immer auslösen
         for alias in tiers.get("company", []):
             if re.search(r'\b' + re.escape(alias) + r'\b', text, re.IGNORECASE):
                 results.append((ticker.upper(), "hoch"))
@@ -195,8 +239,7 @@ def find_all_tickers(text: str) -> list[tuple[str, str]]:
         if matched:
             continue
 
-        # Tier 3: Schwache Signale (Produkte/Brands) – nur mit Finanz-Kontext
-        if text_has_finance:
+        if has_finance:
             for alias in tiers.get("weak", []):
                 if re.search(r'\b' + re.escape(alias) + r'\b', text, re.IGNORECASE):
                     results.append((ticker.upper(), "niedrig"))
@@ -204,30 +247,29 @@ def find_all_tickers(text: str) -> list[tuple[str, str]]:
 
     return results
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # DATA SOURCES
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 def fetch_truth_social() -> list[dict]:
     url = (
         f"https://api.scrapecreators.com/v1/truthsocial/user/posts"
         f"?user_id={TRUMP_TRUTH_ID}&limit=20"
     )
-    headers = {"x-api-key": SCRAPE_KEY}
     try:
-        r = requests.get(url, headers=headers, timeout=20)
+        r = requests.get(url, headers={"x-api-key": SCRAPE_KEY}, timeout=20)
         r.raise_for_status()
         data  = r.json()
         posts = data.get("posts", data.get("data", []))
         print(f"  Truth Social: {len(posts)} Posts abgerufen")
         return posts
+    except requests.exceptions.Timeout:
+        print("  ⚠️  Truth Social: Timeout nach 20s")
+    except requests.exceptions.HTTPError as e:
+        print(f"  ⚠️  Truth Social HTTP-Fehler: {e}")
     except Exception as e:
         print(f"  ⚠️  Truth Social Fehler: {e}")
-        return []
+    return []
 
-# ─────────────────────────────────────────────
-# NACHRICHTEN-RSS (Google News + Finanz-Feeds)
-# Kein API-Key, kein Rate-Limit, feedparser läuft bereits.
-# ─────────────────────────────────────────────
 GNEWS_QUERIES = [
     "Donald Trump stock market",
     "Trump tariff trade company",
@@ -243,8 +285,7 @@ FINANCIAL_RSS_FEEDS = [
     ("AP Business",      "https://feeds.apnews.com/apnews/businessnews"),
 ]
 
-def _rss_entry_to_dict(entry, source: str) -> dict:
-    """Normalisiert einen feedparser-Eintrag auf das Standard-Artikel-Format."""
+def _rss_to_dict(entry, source: str) -> dict:
     return {
         "title":       entry.get("title", ""),
         "description": entry.get("summary", entry.get("description", "")),
@@ -254,7 +295,6 @@ def _rss_entry_to_dict(entry, source: str) -> dict:
     }
 
 def fetch_gnews_rss() -> list[dict]:
-    """Google News RSS – kostenlos, kein API-Key, kein Rate-Limit."""
     results = []
     for q in GNEWS_QUERIES:
         url = (
@@ -262,59 +302,63 @@ def fetch_gnews_rss() -> list[dict]:
             f"?q={requests.utils.quote(q)}&hl=en-US&gl=US&ceid=US:en"
         )
         try:
-            feed     = feedparser.parse(url)
-            articles = [_rss_entry_to_dict(e, "Google News") for e in feed.entries[:15]]
-            results.extend(articles)
-            print(f"  GNews [{q[:35]}]: {len(articles)} Artikel")
+            feed = feedparser.parse(url)
+            arts = [_rss_to_dict(e, "Google News") for e in feed.entries[:15]]
+            results.extend(arts)
+            print(f"  GNews [{q[:35]}]: {len(arts)} Artikel")
         except Exception as ex:
-            print(f"  ⚠️  GNews RSS Fehler ({q[:30]}): {ex}")
+            print(f"  ⚠️  GNews Fehler ({q[:30]}): {ex}")
     return results
 
 def fetch_financial_rss() -> list[dict]:
-    """Finanz-RSS-Feeds – Reuters, CNBC, MarketWatch, Yahoo Finance, AP."""
     results = []
     for name, url in FINANCIAL_RSS_FEEDS:
         try:
-            feed     = feedparser.parse(url)
-            articles = [_rss_entry_to_dict(e, name) for e in feed.entries[:20]]
-            results.extend(articles)
-            print(f"  {name}: {len(articles)} Artikel")
+            feed = feedparser.parse(url)
+            arts = [_rss_to_dict(e, name) for e in feed.entries[:20]]
+            results.extend(arts)
+            print(f"  {name}: {len(arts)} Artikel")
         except Exception as ex:
-            print(f"  ⚠️  {name} RSS Fehler: {ex}")
+            print(f"  ⚠️  {name} Fehler: {ex}")
     return results
 
 def fetch_whitehouse() -> list:
     try:
         feed    = feedparser.parse("https://www.whitehouse.gov/feed/")
         entries = feed.entries[:30]
-        print(f"  White House RSS: {len(entries)} Einträge abgerufen")
+        print(f"  White House RSS: {len(entries)} Einträge")
         return entries
     except Exception as e:
         print(f"  ⚠️  White House RSS Fehler: {e}")
         return []
 
-# ─────────────────────────────────────────────
-# TRUMP HOLDINGS (OGE Form 278 – öffentlich)
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# TRUMP HOLDINGS  (OGE Form 278 – öffentlich)
+# ─────────────────────────────────────────────────────────────────────────────
 TRUMP_HOLDINGS = {
-    "DJT":  "JA – Trump hält ~57% an Trump Media & Technology Group (DJT), Quelle: SEC Form 4 / OGE 2024",
+    "DJT": "JA – Trump hält ~57 % an Trump Media & Technology Group (DJT), Quelle: SEC Form 4 / OGE 2024",
 }
-def trump_holding_info(ticker: str) -> str:
-    return TRUMP_HOLDINGS.get(ticker.upper(),
-        "Nicht aus öffentlichen OGE-Filings (Form 278) bekannt – keine Annahmen.")
 
-# ─────────────────────────────────────────────
-# YAHOO FINANCE – MARKTDATEN
-# ─────────────────────────────────────────────
-# Sonderfälle: Crypto-Ticker brauchen Yahoo-Finance-Suffix
+def trump_holding_info(ticker: str) -> str:
+    return TRUMP_HOLDINGS.get(
+        ticker.upper(),
+        "Nicht aus öffentlichen OGE-Filings (Form 278) bekannt – keine Annahmen."
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# YAHOO FINANCE  –  Marktdaten
+# ─────────────────────────────────────────────────────────────────────────────
 YF_TICKER_MAP = {
-    "BTC": "BTC-USD", "ETH": "ETH-USD", "BRK": "BRK-B",
-    "GOOGL": "GOOGL", "GOOG": "GOOG",
+    "BTC":  "BTC-USD",
+    "ETH":  "ETH-USD",
+    "BRK":  "BRK-B",
+    "GOOGL": "GOOGL",
+    "GOOG":  "GOOG",
 }
 
 @lru_cache(maxsize=512)
 def fetch_market_data(ticker: str) -> dict:
-    """Holt Kursdaten von Yahoo Finance. Gibt leeres Dict zurück bei Fehler."""
+    """Holt 1-Monats-History von Yahoo Finance. Bei Fehler leeres Dict."""
     yf_sym = YF_TICKER_MAP.get(ticker.upper(), ticker.upper())
     try:
         hist = yf.Ticker(yf_sym).history(period="1mo", auto_adjust=True)
@@ -325,52 +369,93 @@ def fetch_market_data(ticker: str) -> dict:
         prev_close = round(float(close.iloc[-2]), 2)
         week_ago   = round(float(close.iloc[-6]) if len(close) >= 6 else float(close.iloc[0]), 2)
         month_ago  = round(float(close.iloc[0]), 2)
-        chg_1d = round((current / prev_close - 1) * 100, 2)
-        chg_1w = round((current / week_ago   - 1) * 100, 2)
-        chg_1m = round((current / month_ago  - 1) * 100, 2)
         return {
-            "price":     current,
-            "chg_1d":   chg_1d,
-            "chg_1w":   chg_1w,
-            "chg_1m":   chg_1m,
+            "price":   current,
+            "chg_1d":  round((current / prev_close - 1) * 100, 2),
+            "chg_1w":  round((current / week_ago   - 1) * 100, 2),
+            "chg_1m":  round((current / month_ago  - 1) * 100, 2),
         }
     except Exception as e:
         print(f"  ⚠️  Yahoo Finance ({ticker}): {e}")
         return {}
 
 def format_market_block(ticker: str) -> str:
-    """Formatiert Marktdaten als lesbaren Block für den Prompt."""
     d = fetch_market_data(ticker)
     if not d:
         return "Marktdaten: nicht verfügbar"
     def arrow(v): return "▲" if v >= 0 else "▼"
     return (
-        f"Letzter Schlusskurs:           {d['price']} USD\n"
-        f"Ggü. vorigem Handelstag:       {arrow(d['chg_1d'])} {d['chg_1d']:+.2f}%\n"
-        f"5 Handelstage:                 {arrow(d['chg_1w'])} {d['chg_1w']:+.2f}%\n"
-        f"1 Monat:                       {arrow(d['chg_1m'])} {d['chg_1m']:+.2f}%"
+        f"Letzter Schlusskurs:      {d['price']:.2f} USD\n"
+        f"Ggü. Vortag:              {arrow(d['chg_1d'])} {d['chg_1d']:+.2f}%\n"
+        f"5 Handelstage:            {arrow(d['chg_1w'])} {d['chg_1w']:+.2f}%\n"
+        f"1 Monat:                  {arrow(d['chg_1m'])} {d['chg_1m']:+.2f}%"
     )
 
-# ─────────────────────────────────────────────
-# CLAUDE SEKTOR-ERKENNUNG (Truth Social ohne direkten Ticker-Match)
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# TURBO-ZERTIFIKAT-EMPFEHLUNG
+# ─────────────────────────────────────────────────────────────────────────────
+def parse_trade_direction(alert_text: str) -> str:
+    """Extrahiert LONG / SHORT / UNKLAR aus dem Claude-Output."""
+    for line in alert_text.splitlines():
+        if "trade-richtung:" in line.lower():
+            upper = line.upper()
+            if "LONG"  in upper: return "LONG"
+            if "SHORT" in upper: return "SHORT"
+    return "UNKLAR"
+
+def turbo_recommendation(ticker: str, direction: str) -> str:
+    """
+    Gibt eine skalierbar handelbare Turbo-Empfehlung aus.
+    Kriterien: KO-Abstand > 12%, Spread < 0.5% (muss live geprüft werden).
+    """
+    if direction == "UNKLAR":
+        return "⛔ Keine Empfehlung – Trade-Richtung unklar"
+    data = fetch_market_data(ticker)
+    if not data:
+        return "⛔ Keine Empfehlung – Marktdaten nicht verfügbar"
+
+    price = data["price"]
+
+    if direction == "LONG":
+        ko      = round(price * 0.88, 2)          # 12 % unterhalb
+        lever   = round(price / (price - ko), 1)
+        return (
+            f"📈 LONG-Turbo auf {ticker}\n"
+            f"   Aktueller Kurs:   {price:.2f} USD\n"
+            f"   Empf. KO-Level:  ≤ {ko:.2f} USD  (>12 % Abstand)\n"
+            f"   Hebel (approx):  ~{lever}x\n"
+            f"   ⚠️  Spread vor Kauf prüfen: < 0.5 % erforderlich"
+        )
+    else:   # SHORT
+        ko      = round(price * 1.12, 2)          # 12 % oberhalb
+        lever   = round(price / (ko - price), 1)
+        return (
+            f"📉 SHORT-Turbo auf {ticker}\n"
+            f"   Aktueller Kurs:   {price:.2f} USD\n"
+            f"   Empf. KO-Level:  ≥ {ko:.2f} USD  (>12 % Abstand)\n"
+            f"   Hebel (approx):  ~{lever}x\n"
+            f"   ⚠️  Spread vor Kauf prüfen: < 0.5 % erforderlich"
+        )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLAUDE SEKTOR-ERKENNUNG  (Truth Social ohne direkten Ticker-Match)
+# ─────────────────────────────────────────────────────────────────────────────
 def discover_tickers_via_claude(text: str) -> list[tuple[str, str]]:
     """
-    Fragt Claude: Welche börsennotierten Unternehmen sind durch diesen
-    Trump-Post am wahrscheinlichsten direkt betroffen?
-    Gibt max. 3 (ticker, "claude") Tupel zurück, oder [] wenn keiner.
+    Fragt Claude welche börsennotierten Unternehmen durch den Post betroffen sind.
+    Gibt max. 3 (ticker, 'claude') Tupel zurück, oder [] bei keinem Treffer.
     """
     prompt = (
         "Trump hat folgenden Text auf Truth Social gepostet:\n\n"
         f"{text}\n\n"
         "Welche börsennotierten US-Unternehmen sind dadurch am wahrscheinlichsten "
         "DIREKT und KONKRET betroffen (Kursreaktion realistisch)? "
-        "Antworte NUR mit einer kommaseparierten Liste von max. 3 Ticker-Symbolen (z.B. NVDA,TSM,INTC). "
-        "Falls kein konkreter Unternehmensbezug erkennbar ist, antworte nur mit: NONE"
+        "Antworte NUR mit kommaseparierten Ticker-Symbolen, max. 3 (z.B. NVDA,TSM,INTC). "
+        "Falls kein konkreter Unternehmensbezug erkennbar: antworte nur mit NONE"
     )
     try:
         resp = client.messages.create(
-            model="claude-sonnet-4-6",
+            model=MODEL,
             max_tokens=30,
             temperature=0,
             messages=[{"role": "user", "content": prompt}],
@@ -379,79 +464,98 @@ def discover_tickers_via_claude(text: str) -> list[tuple[str, str]]:
         if raw == "NONE" or not raw:
             return []
         tickers = [t.strip() for t in raw.split(",") if re.match(r'^[A-Z]{1,5}$', t.strip())]
-        print(f"  🔍 Claude Sektor-Erkennung: {tickers}")
+        if tickers:
+            print(f"  🔍 Claude Sektor-Erkennung: {tickers}")
         return [(t, "claude") for t in tickers[:3]]
     except Exception as e:
         print(f"  ⚠️  Sektor-Erkennung Fehler: {e}")
         return []
 
-# ─────────────────────────────────────────────
-# LLM ANALYSIS + ALERT
-# ─────────────────────────────────────────────
-def analyze_and_alert(source: str, published, raw_text: str, ticker: str, url: str,
-                      confidence: str = "hoch"):
-    market_block  = format_market_block(ticker)
-    holding_info  = trump_holding_info(ticker)
+# ─────────────────────────────────────────────────────────────────────────────
+# HAUPTANALYSE  –  LLM + Alert + E-Mail
+# ─────────────────────────────────────────────────────────────────────────────
+def analyze_and_alert(
+    source:     str,
+    published,
+    raw_text:   str,
+    ticker:     str,
+    url:        str,
+    confidence: str = "hoch",
+):
+    market_block = format_market_block(ticker)
+    holding_info = trump_holding_info(ticker)
+    finbert_sent = get_finbert_sentiment(raw_text)
 
+    # Konfidenz-Block für Prompt
     if confidence == "niedrig":
-        confidence_block = (
-            f"NIEDRIG – {ticker} wurde nur über ein indirektes Stichwort (Produkt/Brand) gefunden, "
-            f"nicht über Ticker-Symbol oder Firmenname. Prüfe im Text, ob {ticker} wirklich gemeint ist."
+        conf_desc = (
+            f"NIEDRIG – {ticker} wurde nur über ein Produkt/Brand-Stichwort erkannt, "
+            f"nicht über Ticker-Symbol oder Firmenname direkt."
         )
     elif confidence == "claude":
-        confidence_block = (
-            f"CLAUDE-INFERENZ – {ticker} wurde nicht explizit im Text genannt, sondern von Claude als "
-            f"wahrscheinlich betroffenes Unternehmen identifiziert. Bitte kritisch prüfen."
+        conf_desc = (
+            f"CLAUDE-INFERENZ – {ticker} nicht explizit im Text genannt; "
+            f"Claude hat dieses Unternehmen als wahrscheinlich betroffen eingestuft."
         )
     else:
-        confidence_block = "HOCH – Ticker-Symbol oder Firmenname direkt im Text gefunden."
+        conf_desc = "HOCH – Ticker-Symbol oder Firmenname direkt im Text gefunden."
 
-    prompt = f"""Du bist ein präziser Finanz-Analyst. Analysiere folgenden Trump-bezogenen Text.
-Dir werden echte Marktdaten und verifizierte OGE-Informationen geliefert – nutze NUR diese, keine Annahmen.
+    prompt = f"""Du bist ein erfahrener Finanz-Analyst mit Fokus auf politisch getriebene Kursbewegungen.
+Analysiere den folgenden Trump-bezogenen Text in Bezug auf das Unternehmen {ticker}.
 
-── TEXT ──────────────────────────────────────
+═══ QUELLENTEXT ═══════════════════════════════════════════
 {raw_text}
 
-── MARKTDATEN ({ticker}, Yahoo Finance, aktuell) ──
+═══ MARKTDATEN ({ticker} · Yahoo Finance · aktuell) ════════
 {market_block}
 
-── TRUMP-BETEILIGUNG (OGE Form 278, öffentlich) ──
+═══ FINBERT-SENTIMENT (maschinell) ════════════════════════
+{finbert_sent}
+
+═══ TRUMP-BETEILIGUNG (OGE Form 278) ══════════════════════
 {holding_info}
 
-── ERKENNUNGS-KONFIDENZ ──
-{confidence_block}
+═══ ERKENNUNGS-KONFIDENZ ══════════════════════════════════
+{conf_desc}
 
-Antworte NUR mit folgendem Format (keine Einleitung, keine Ergänzungen):
+AUFGABE: Antworte ausschließlich im folgenden Format – keine Einleitung, kein Kommentar:
 
-RELEVANZ: [JA – der Artikel behandelt {ticker} konkret UND direkt / NEIN – kein konkreter Unternehmensbezug]
-Unternehmen: [Firmenname] ({ticker})
-Quelle: {source} – [max. 1 Zeile Zusammenfassung des Textes]
-Sentiment: [positiv / negativ / neutral – begründet aus dem Text]
-Marktreaktion: [Hat der Kurs schon reagiert? Einschätzung basierend auf den Tagesdaten]
+RELEVANZ: [JA – {ticker} ist konkreter Gegenstand des Textes / NEIN – kein direkter Unternehmensbezug]
+Unternehmen: [Vollständiger Firmenname] ({ticker})
+Quelle: {source} – [1 Satz Zusammenfassung]
+Sentiment: [positiv / negativ / neutral] – [Begründung in max. 1 Satz aus dem Text]
+FinBERT-Check: {finbert_sent} – [stimmt das mit dem Textinhalt überein? 1 Satz]
+Marktreaktion: [Hat der Kurs bereits reagiert basierend auf den Tagesdaten? 1 Satz]
 Trump-Beteiligung: {holding_info}
-Zusammenfassung: [max. 2 Sätze – nur aus Textinhalt ableitbar, keine Spekulation]
-Trade-Richtung: [LONG / SHORT / UNKLAR – Begründung aus Text UND Kurslage]
-Konfidenz: [hoch / mittel / niedrig – kombiniert aus Erkennungs-Konfidenz ({confidence}) UND Textqualität]"""
+Zusammenfassung: [max. 2 Sätze – nur aus dem Text ableitbar, keine Spekulation]
+Trade-Richtung: [LONG / SHORT / UNKLAR] – [Begründung aus Text UND Kurslage in 1 Satz]
+Konfidenz: [hoch / mittel / niedrig] – [kombiniert aus Erkennungs-Konfidenz und Textqualität]"""
 
+    # ── Claude-Aufruf ────────────────────────────────────────────────────────
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=600,
-            temperature=0.2,
+            model=MODEL,
+            max_tokens=700,
+            temperature=0.1,
             messages=[{"role": "user", "content": prompt}],
         )
-        alert_text = response.content[0].text
+        alert_text = response.content[0].text.strip()
     except Exception as e:
-        print(f"  ❌ Claude-API Fehler: {e}")
-        return
+        print(f"  ❌ Claude-API Fehler ({ticker}): {e}")
+        return   # kein Alert bei API-Fehler
 
-    # Relevanz-Check: kein konkreter Unternehmensbezug → kein Alert
-    first_line = alert_text.strip().splitlines()[0].upper()
+    # ── Relevanz-Gate ────────────────────────────────────────────────────────
+    first_line = alert_text.splitlines()[0].upper()
     if "RELEVANZ:" in first_line and "NEIN" in first_line:
-        print(f"  ⏭️  {ticker} übersprungen – kein konkreter Unternehmensbezug laut Claude")
+        print(f"  ⏭️  {ticker} übersprungen – kein konkreter Unternehmensbezug")
         return
 
-    event_id = hashlib.sha256((ticker + raw_text).encode("utf-8")).hexdigest()
+    # ── Turbo-Empfehlung ─────────────────────────────────────────────────────
+    direction   = parse_trade_direction(alert_text)
+    turbo_block = turbo_recommendation(ticker, direction)
+
+    # ── SQLite-Dedup ─────────────────────────────────────────────────────────
+    event_id = get_hash(ticker + raw_text)
     h        = get_hash(raw_text + ticker)
     try:
         conn.execute(
@@ -460,65 +564,91 @@ Konfidenz: [hoch / mittel / niedrig – kombiniert aus Erkennungs-Konfidenz ({co
         )
         conn.commit()
     except sqlite3.IntegrityError:
-        pass
+        pass   # bereits in DB, trotzdem E-Mail schicken (Race-Condition-Schutz)
 
+    # ── Konfidenz-Badge ──────────────────────────────────────────────────────
     if confidence == "niedrig":
-        conf_badge = (
-            '<span style="background:#e67e22;color:white;padding:2px 6px;border-radius:4px;font-size:11px;">'
-            '⚠️ Erkennungs-Konfidenz: niedrig</span><br><br>'
+        badge = (
+            '<span style="background:#e67e22;color:#fff;padding:2px 8px;'
+            'border-radius:4px;font-size:11px;">⚠️ Konfidenz: niedrig</span><br><br>'
         )
     elif confidence == "claude":
-        conf_badge = (
-            '<span style="background:#8e44ad;color:white;padding:2px 6px;border-radius:4px;font-size:11px;">'
-            '🤖 Claude-Inferenz: kein direkter Ticker-Match</span><br><br>'
+        badge = (
+            '<span style="background:#8e44ad;color:#fff;padding:2px 8px;'
+            'border-radius:4px;font-size:11px;">🤖 Claude-Inferenz</span><br><br>'
         )
     else:
-        conf_badge = ""
-    html = f"""
-<html><body style="font-family:monospace;font-size:14px;">
-<h2 style="color:#c0392b;">🚨 Trump-Impact Alert – {ticker}</h2>
-{conf_badge}<pre style="background:#f4f4f4;padding:12px;border-radius:6px;">{alert_text}</pre>
-<hr>
-<h3 style="color:#2c3e50;">📊 Marktdaten ({ticker})</h3>
+        badge = ""
+
+    # ── HTML-E-Mail ──────────────────────────────────────────────────────────
+    html_body = f"""
+<html><body style="font-family:monospace;font-size:14px;max-width:700px;margin:auto;">
+
+<h2 style="color:#c0392b;border-bottom:2px solid #c0392b;padding-bottom:6px;">
+  🚨 Trump-Impact Alert – {ticker}
+</h2>
+
+{badge}
+
+<pre style="background:#f4f4f4;padding:14px;border-radius:6px;
+            border-left:4px solid #c0392b;white-space:pre-wrap;">{alert_text}</pre>
+
+<hr style="border:1px solid #ddd;">
+
+<h3 style="color:#2c3e50;">📊 Marktdaten – {ticker}</h3>
 <pre style="background:#eaf4fb;padding:10px;border-radius:6px;">{market_block}</pre>
-<hr>
-<p><b>Quelle:</b> {source}<br>
-<b>Veröffentlicht:</b> {published}<br>
-<b>Original:</b> <a href="{url}">{url}</a></p>
-<p style="color:#888;font-size:11px;">
-Generiert {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')} · Zeitfenster: letzte {LOOKBACK_HOURS}h
+
+<h3 style="color:#27ae60;">🎯 Turbo-Zertifikat-Empfehlung</h3>
+<pre style="background:#eafaf1;padding:10px;border-radius:6px;">{turbo_block}</pre>
+
+<hr style="border:1px solid #ddd;">
+
+<p style="font-size:12px;color:#555;">
+  <b>Quelle:</b> {source}<br>
+  <b>Veröffentlicht:</b> {published}<br>
+  <b>FinBERT-Sentiment:</b> {finbert_sent}<br>
+  <b>Original:</b> <a href="{url}">{url}</a>
 </p>
+
+<p style="font-size:10px;color:#aaa;">
+  Generiert {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}
+  · Zeitfenster: letzte {LOOKBACK_HOURS}h
+  · Modell: {MODEL}
+</p>
+
 </body></html>
 """
-    conf_tag = " ⚠️ [niedrig]" if confidence == "niedrig" else ""
-    subject = f"🚨 Trump-Impact Alert – {ticker}{conf_tag} – Trade Candidate"
-    send_gmail(subject, html)
-    print(f"  🎯 Alert: {ticker} via {source}")
+    conf_tag = {"niedrig": " ⚠️", "claude": " 🤖"}.get(confidence, "")
+    subject  = f"🚨 Trump-Impact Alert – {ticker}{conf_tag} [{direction}] – {source}"
+    send_gmail(subject, html_body)
+    print(f"  🎯 Alert gesendet: {ticker} | {direction} | {source} | FinBERT: {finbert_sent}")
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 def main():
-    print(f"\n{'='*60}")
-    print(f"  Trump-Impact Monitor – {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    print(f"  Zeitfenster: alles ab {CUTOFF.strftime('%Y-%m-%d %H:%M:%S UTC')} (letzte {LOOKBACK_HOURS}h)")
-    print(f"{'='*60}\n")
+    print(f"\n{'═'*62}")
+    print(f"  Trump-Impact Monitor  –  {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print(f"  Zeitfenster: ab {CUTOFF.strftime('%Y-%m-%d %H:%M UTC')}  (letzte {LOOKBACK_HOURS}h)")
+    print(f"  Modell: {MODEL}")
+    print(f"{'═'*62}\n")
 
-    processed = 0
-    seen_urls: set[str] = set()   # URL-Dedup innerhalb eines Runs (verhindert Doppel-Alerts bei Mehrfach-Feeds)
+    processed  = 0
+    seen_urls: set[str] = set()
 
     def _cap_reached() -> bool:
         if processed >= MAX_ALERTS_PER_RUN:
-            print(f"  ⚠️  Alert-Cap ({MAX_ALERTS_PER_RUN}) erreicht – Rest übersprungen.")
+            print(f"  ⚠️  Alert-Cap ({MAX_ALERTS_PER_RUN}) erreicht – verbleibende Artikel übersprungen.")
             return True
         return False
 
-    def _sorted_tickers(tickers):
+    def _sorted_tickers(tickers: list) -> list:
+        """Sortiert hoch vor niedrig/claude, begrenzt auf MAX_TICKERS_PER_ART."""
         high = [(t, c) for t, c in tickers if c == "hoch"]
-        low  = [(t, c) for t, c in tickers if c != "hoch"]
-        return (high + low)[:MAX_TICKERS_PER_ARTICLE]
+        rest = [(t, c) for t, c in tickers if c != "hoch"]
+        return (high + rest)[:MAX_TICKERS_PER_ART]
 
-    # ── Truth Social ──────────────────────────────────────────────────
+    # ── Truth Social ──────────────────────────────────────────────────────────
     print("📡 Truth Social …")
     for post in fetch_truth_social():
         if _cap_reached():
@@ -533,36 +663,36 @@ def main():
             continue
         tickers = find_all_tickers(text)
         if not tickers:
-            # Kein direkter Match → Claude nach betroffenen Unternehmen fragen
-            tickers = discover_tickers_via_claude(text)
+            tickers = discover_tickers_via_claude(text)   # Sektor-Inferenz als Fallback
         if not tickers:
             continue
-        url = post.get("url", post.get("uri", "https://truthsocial.com/@realDonaldTrump"))
+        post_url = post.get("url", post.get("uri", "https://truthsocial.com/@realDonaldTrump"))
         for ticker, confidence in _sorted_tickers(tickers):
             if _cap_reached():
                 break
-            h = get_hash(text + ticker)
-            if already_seen(h):
+            if already_seen(get_hash(text + ticker)):
                 continue
-            analyze_and_alert("Truth Social", ts, text, ticker, url, confidence)
+            analyze_and_alert("Truth Social", ts, text, ticker, post_url, confidence)
             processed += 1
 
-    # ── Nachrichten-RSS (Google News + Finanz-Feeds) ──────────────────
+    # ── News-RSS (Google News + Finanz-Feeds) ────────────────────────────────
     print("\n📰 Nachrichten-RSS …")
     for article in fetch_gnews_rss() + fetch_financial_rss():
         if _cap_reached():
             break
         art_url = article.get("url", "")
         if art_url and art_url in seen_urls:
-            continue                          # gleicher Artikel aus anderem Feed/Query
+            continue
         if art_url:
             seen_urls.add(art_url)
-        text = clean_text((article.get("title") or "") + " " + (article.get("description") or ""))
+        text = clean_text(
+            (article.get("title") or "") + " " + (article.get("description") or "")
+        )
         if not text:
             continue
         if not is_recent(article.get("publishedAt")):
             continue
-        if not mentions_trump(text):          # allgemeine Finanz-Feeds brauchen Trump-Bezug
+        if not mentions_trump(text):
             continue
         if not is_financially_relevant(text):
             continue
@@ -572,13 +702,19 @@ def main():
         for ticker, confidence in _sorted_tickers(tickers):
             if _cap_reached():
                 break
-            h = get_hash(text + ticker)
-            if already_seen(h):
+            if already_seen(get_hash(text + ticker)):
                 continue
-            analyze_and_alert(article.get("_source", "RSS"), article.get("publishedAt", ""), text, ticker, article.get("url", ""), confidence)
+            analyze_and_alert(
+                article.get("_source", "RSS"),
+                article.get("publishedAt", ""),
+                text,
+                ticker,
+                art_url,
+                confidence,
+            )
             processed += 1
 
-    # ── White House RSS ────────────────────────────────────────────────
+    # ── White House RSS ───────────────────────────────────────────────────────
     print("\n🏛️  White House RSS …")
     for entry in fetch_whitehouse():
         if _cap_reached():
@@ -597,8 +733,7 @@ def main():
         for ticker, confidence in _sorted_tickers(tickers):
             if _cap_reached():
                 break
-            h = get_hash(text + ticker)
-            if already_seen(h):
+            if already_seen(get_hash(text + ticker)):
                 continue
             analyze_and_alert(
                 "White House",
@@ -610,9 +745,9 @@ def main():
             )
             processed += 1
 
-    print(f"\n{'='*60}")
+    print(f"\n{'═'*62}")
     print(f"  ✅ Durchlauf beendet – {processed} Alert(s) verarbeitet")
-    print(f"{'='*60}\n")
+    print(f"{'═'*62}\n")
 
 
 if __name__ == "__main__":
