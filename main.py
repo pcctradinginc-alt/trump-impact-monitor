@@ -384,6 +384,7 @@ Dir werden echte Marktdaten und verifizierte OGE-Informationen geliefert – nut
 
 Antworte NUR mit folgendem Format (keine Einleitung, keine Ergänzungen):
 
+RELEVANZ: [JA – der Artikel behandelt {ticker} konkret UND direkt / NEIN – kein konkreter Unternehmensbezug]
 Unternehmen: [Firmenname] ({ticker})
 Quelle: {source} – [max. 1 Zeile Zusammenfassung des Textes]
 Sentiment: [positiv / negativ / neutral – begründet aus dem Text]
@@ -403,6 +404,12 @@ Konfidenz: [hoch / mittel / niedrig – kombiniert aus Erkennungs-Konfidenz ({co
         alert_text = response.content[0].text
     except Exception as e:
         print(f"  ❌ Claude-API Fehler: {e}")
+        return
+
+    # Relevanz-Check: kein konkreter Unternehmensbezug → kein Alert
+    first_line = alert_text.strip().splitlines()[0].upper()
+    if "RELEVANZ:" in first_line and "NEIN" in first_line:
+        print(f"  ⏭️  {ticker} übersprungen – kein konkreter Unternehmensbezug laut Claude")
         return
 
     event_id = hashlib.sha256((ticker + raw_text).encode("utf-8")).hexdigest()
