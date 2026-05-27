@@ -1041,7 +1041,7 @@
   },
   "TGT": {
     "symbol": ["TGT"],
-    "company": ["Target", "Target Corporation", "Brian Cornell"],
+    "company": ["Target Corporation", "Brian Cornell"],
     "weak": []
   },
   "COST": {

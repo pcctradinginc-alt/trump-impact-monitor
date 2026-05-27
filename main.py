@@ -71,6 +71,16 @@ client = Anthropic(api_key=ANTHROPIC_API_KEY)
 # ─────────────────────────────────────────────
 # FINANCIAL RELEVANCE KEYWORDS (Pre-Filter)
 # ─────────────────────────────────────────────
+# Trump-Erwähnung – Pflicht für allgemeine Finanz-RSS-Feeds
+TRUMP_NAMES = {
+    "trump", "donald trump", "donald j. trump", "potus",
+    "mar-a-lago", "truth social", "trump administration",
+}
+
+def mentions_trump(text: str) -> bool:
+    t = text.lower()
+    return any(name in t for name in TRUMP_NAMES)
+
 FINANCIAL_KEYWORDS = {
     "tariff", "tariffs", "sanction", "sanctions", "trade deal", "trade war",
     "invest", "investment", "stock", "shares", "market", "deal", "contract",
@@ -480,6 +490,8 @@ def main():
         if not text:
             continue
         if not is_recent(article.get("publishedAt")):
+            continue
+        if not mentions_trump(text):          # allgemeine Finanz-Feeds brauchen Trump-Bezug
             continue
         if not is_financially_relevant(text):
             continue
