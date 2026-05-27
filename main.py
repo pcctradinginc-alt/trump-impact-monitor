@@ -4,6 +4,7 @@ import json
 import sqlite3
 import hashlib
 import socket
+import html
 import feedparser
 import requests
 import yfinance as yf
@@ -92,6 +93,14 @@ FINANCIAL_KEYWORDS = {
     "crypto", "bitcoin", "deregulation", "privatize", "nationalize",
     "price", "cost", "supply chain", "jobs", "layoff", "hire",
 }
+
+def clean_text(text: str) -> str:
+    """Entfernt HTML-Tags, URLs und überflüssige Whitespaces für sauberes Entity-Matching."""
+    text = html.unescape(text)
+    text = re.sub(r'https?://\S+', '', text)          # URLs entfernen
+    text = re.sub(r'<[^>]+>', ' ', text)               # HTML-Tags entfernen
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 def is_financially_relevant(text: str) -> bool:
     text_lower = text.lower()
@@ -460,7 +469,7 @@ def main():
     for post in fetch_truth_social():
         if _cap_reached():
             break
-        text = post.get("text", post.get("content", ""))
+        text = clean_text(post.get("text", post.get("content", "")))
         if not text:
             continue
         ts = post.get("created_at", post.get("published"))
@@ -486,7 +495,7 @@ def main():
     for article in fetch_gnews_rss() + fetch_financial_rss():
         if _cap_reached():
             break
-        text = ((article.get("title") or "") + " " + (article.get("description") or "")).strip()
+        text = clean_text((article.get("title") or "") + " " + (article.get("description") or ""))
         if not text:
             continue
         if not is_recent(article.get("publishedAt")):
@@ -512,7 +521,7 @@ def main():
     for entry in fetch_whitehouse():
         if _cap_reached():
             break
-        text = (entry.get("title", "") + " " + entry.get("summary", "")).strip()
+        text = clean_text(entry.get("title", "") + " " + entry.get("summary", ""))
         if not text:
             continue
         ts = entry.get("published_parsed") or entry.get("updated_parsed")
