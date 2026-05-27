@@ -270,13 +270,6 @@ def fetch_truth_social() -> list[dict]:
         print(f"  ⚠️  Truth Social Fehler: {e}")
     return []
 
-GNEWS_QUERIES = [
-    "Donald Trump stock market",
-    "Trump tariff trade company",
-    "Trump executive order sanctions",
-    "Trump economy policy",
-]
-
 FINANCIAL_RSS_FEEDS = [
     ("Reuters Business", "https://feeds.reuters.com/reuters/businessNews"),
     ("CNBC Markets",     "https://www.cnbc.com/id/10000664/device/rss/rss.html"),
@@ -293,22 +286,6 @@ def _rss_to_dict(entry, source: str) -> dict:
         "url":         entry.get("link", ""),
         "_source":     source,
     }
-
-def fetch_gnews_rss() -> list[dict]:
-    results = []
-    for q in GNEWS_QUERIES:
-        url = (
-            "https://news.google.com/rss/search"
-            f"?q={requests.utils.quote(q)}&hl=en-US&gl=US&ceid=US:en"
-        )
-        try:
-            feed = feedparser.parse(url)
-            arts = [_rss_to_dict(e, "Google News") for e in feed.entries[:15]]
-            results.extend(arts)
-            print(f"  GNews [{q[:35]}]: {len(arts)} Artikel")
-        except Exception as ex:
-            print(f"  ⚠️  GNews Fehler ({q[:30]}): {ex}")
-    return results
 
 def fetch_financial_rss() -> list[dict]:
     results = []
@@ -677,7 +654,7 @@ def main():
 
     # ── News-RSS (Google News + Finanz-Feeds) ────────────────────────────────
     print("\n📰 Nachrichten-RSS …")
-    for article in fetch_gnews_rss() + fetch_financial_rss():
+    for article in fetch_financial_rss():
         if _cap_reached():
             break
         art_url = article.get("url", "")
