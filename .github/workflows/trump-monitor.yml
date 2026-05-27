@@ -2,7 +2,7 @@ name: Trump Impact Monitor (hourly)
 
 on:
   schedule:
-    - cron: '0 * * * *'   # every full hour
+    - cron: '0 */4 * * *'  # every 4 hours (6x per day)
   workflow_dispatch:       # manual trigger via GitHub UI
 
 permissions:
